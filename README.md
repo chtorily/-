@@ -5,6 +5,18 @@ import matplotlib.pyplot as plt
 from typing import List, Dict, Tuple, Optional, Set
 import time
 from scipy.special import erfinv
+import logging  # 添加 logging 导入
+import datetime  # 添加 datetime 导入
+
+# 配置日志记录
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'uav_simulation_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
+        logging.StreamHandler()  # 同时输出到控制台
+    ]
+)
 
 # 参数设置
 AIRSPACE_SIZE = 400  # 空域单元大小（米）
@@ -17,8 +29,7 @@ TIME_STEP_LENGTH = 2  # 时间步长（秒）
 POSITIONING_ERROR_RADIUS = 40  # 定位误差半径（米）
 SAFETY_THRESHOLD = 0.0230  # 安全阈值
 OCCUPANCY_RATE_THRESHOLD = 0.0001  # 占用率识别阈值
-MAX_CTA_POSTPONEMENT = 5  # 最大CTA推迟次数
-
+MAX_CTA_POSTPONEMENT = 10  # 最大CTA推迟次数
 
 # 计算标准差 sigma
 SIGMA = POSITIONING_ERROR_RADIUS / (np.sqrt(2) * erfinv(0.95))
@@ -27,7 +38,7 @@ SIGMA = POSITIONING_ERROR_RADIUS / (np.sqrt(2) * erfinv(0.95))
 class UAVTrajectoryPlanner:
     def __init__(self):
         self.traffic_densities = [10, 20, 30, 40, 50, 60]
-        self.scenes_per_density = 100
+        self.scenes_per_density = 1
         self.occupancy_rate_map = self.build_occupancy_rate_map(
             GRID_SIZE, SIGMA, 100, OCCUPANCY_RATE_THRESHOLD
         )
@@ -146,7 +157,8 @@ class UAVTrajectoryPlanner:
 
         return False, grid_occupancy
 
-    def generate_reachable_grids(self, current_grid: Tuple[int, int], current_time: int, obstacles: Dict) -> Set[Tuple[int, int]]:
+    def generate_reachable_grids(self, current_grid: Tuple[int, int], current_time: int, obstacles: Dict) -> Set[
+        Tuple[int, int]]:
         reachable_grids = set()
 
         for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0),
@@ -164,41 +176,54 @@ class UAVTrajectoryPlanner:
 
         return reachable_grids
 
-    def build_weighted_digraph(self, start: Tuple[float, float], goal: Tuple[float, float], obstacles: Dict, entry_time: int, exit_time: int) -> Dict:
+    def build_weighted_digraph(self, start: Tuple[float, float], goal: Tuple[float, float], obstacles: Dict,
+                               entry_time: int, exit_time: int) -> Dict:
         weighted_digraph = {}
         open_set = {start}
         came_from = {}
         g_score = {start: 0}
         f_score = {start: self.heuristic(start, goal)}
 
+        # 增加时间窗口检查
+        max_allowed_time = min(exit_time, SIMULATION_DURATION)
+
         while open_set:
             current = min(open_set, key=lambda x: f_score.get(x, float('inf')))
 
             if current == goal:
+                # 检查是否在允许的时间范围内完成
                 path = []
-                while current in came_from:
-                    path.append(current)
-                    current = came_from[current]
+                temp = current
+                while temp in came_from:
+                    path.append(temp)
+                    temp = came_from[temp]
                 path.append(start)
                 path.reverse()
-                return path
+
+                path_duration = (len(path) - 1) * TIME_STEP_LENGTH
+                if entry_time + path_duration <= max_allowed_time:
+                    return path
+                return None
 
             open_set.remove(current)
 
-            current_time = entry_time + int(np.linalg.norm(np.array(current) - np.array(start)) / GRID_SIZE)
-            if current_time >= exit_time:
+            current_time = entry_time + int(g_score[current] / GRID_SIZE * TIME_STEP_LENGTH)
+            if current_time >= max_allowed_time:
                 continue
 
             reachable_grids = self.generate_reachable_grids(current, current_time, obstacles)
 
             for neighbor in reachable_grids:
-                tentative_g_score = g_score[current] + GRID_SIZE
+                # 考虑时间步长的移动代价
+                movement_cost = GRID_SIZE * TIME_STEP_LENGTH
+                tentative_g_score = g_score[current] + movement_cost
 
                 if (neighbor not in g_score or
                         tentative_g_score < g_score[neighbor]):
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g_score
-                    f_score[neighbor] = g_score[neighbor] + self.heuristic(neighbor, goal)
+                    f_score[neighbor] = (g_score[neighbor] +
+                                         self.heuristic(neighbor, goal))
                     if neighbor not in open_set:
                         open_set.add(neighbor)
 
@@ -413,99 +438,41 @@ def main():
     evaluate_performance("simulation_results.json")
 
 
-def evaluate_performance(results_file: str):
-    with open(results_file, "r") as f:
-        results = json.load(f)
-
-    metrics = {
-        "conflict_resolution_success_rate": [],
-        "average_computing_time": [],
-        "average_extra_energy_consumption_rate": [],
-        "average_delay_time_rate": []
-    }
-
-    traffic_densities = [10, 20, 30, 40, 50, 60]
-
-    for density in traffic_densities:
-        density_results = results[str(density)]
-
-        success_rates = []
-        computing_times = []
-        extra_energy_rates = []
-        delay_time_rates = []
-
-        for scene_result in density_results:
-            num_uavs = len(scene_result['uavs'])
-            if num_uavs == 0:
-                continue
-
-            num_resolved = sum(
-                1 for uav in scene_result['uavs']
-                if 'optimal_trajectory' in uav and uav['optimal_trajectory'] is not None
-            )
-            success_rates.append(num_resolved / num_uavs)
-
-            avg_computing_time = np.mean([
-                uav['computing_time']
-                for uav in scene_result['uavs']
-            ])
-            computing_times.append(avg_computing_time)
-
-            total_initial_energy = sum(
-                uav['initial_energy']
-                for uav in scene_result['uavs']
-            )
-            if total_initial_energy > 0:
-                total_extra_energy = sum(
-                    uav['extra_energy']
-                    for uav in scene_result['uavs']
-                )
-                extra_energy_rates.append(total_extra_energy / total_initial_energy)
-
-            avg_delay_time = np.mean([
-                uav['delay_time']
-                for uav in scene_result['uavs']
-            ])
-            delay_time_rates.append(avg_delay_time / SIMULATION_DURATION)
-
-        metrics["conflict_resolution_success_rate"].append(np.mean(success_rates))
-        metrics["average_computing_time"].append(np.mean(computing_times))
-        metrics["average_extra_energy_consumption_rate"].append(np.mean(extra_energy_rates))
-        metrics["average_delay_time_rate"].append(np.mean(delay_time_rates))
-
-    plot_performance(metrics, traffic_densities)
-
-
 def plot_performance(metrics: Dict, traffic_densities: List[int]):
+    """绘制性能评估图表"""
+    logger = logging.getLogger(__name__)
     try:
+        plt.style.use('ggplot')  # 使用其他样式
+        plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体
+        plt.rcParams['axes.unicode_minus'] = False  # 用于显示负号
         fig, axs = plt.subplots(2, 2, figsize=(15, 12))
 
         plot_configs = [
             {
                 'metric': 'conflict_resolution_success_rate',
-                'title': 'Conflict Resolution Success Rate',
-                'ylabel': 'Success Rate',
+                'title': '冲突解决成功率',
+                'ylabel': '成功率',
                 'color': 'blue',
                 'marker': 'o'
             },
             {
                 'metric': 'average_computing_time',
-                'title': 'Average Computing Time',
-                'ylabel': 'Time (seconds)',
+                'title': '平均计算时间',
+                'ylabel': '时间(秒)',
                 'color': 'green',
                 'marker': 's'
             },
             {
                 'metric': 'average_extra_energy_consumption_rate',
-                'title': 'Extra Energy Consumption Rate',
-                'ylabel': 'Rate',
+                'title': '额外能耗率',
+                'ylabel': '比率',
                 'color': 'red',
                 'marker': '^'
             },
             {
                 'metric': 'average_delay_time_rate',
-                'title': 'Average Delay Time Rate',
-                'ylabel': 'Rate',
+                'title': '平均延迟时间率',
+                'ylabel': '比率',
                 'color': 'purple',
                 'marker': 'd'
             }
@@ -516,23 +483,42 @@ def plot_performance(metrics: Dict, traffic_densities: List[int]):
             col = idx % 2
             ax = axs[row, col]
 
+            metric_values = metrics[config['metric']]
+
+            # 确保数据有效，并填充缺失值
+            if len(metric_values) != len(traffic_densities):
+                logger.warning(
+                    f"数据长度不匹配: {config['metric']}, 预期长度 {len(traffic_densities)}, 实际长度 {len(metric_values)}")
+                # 填充缺失值（例如用 None 或 np.nan）
+                metric_values = [metric_values[i] if i < len(metric_values) else None for i in
+                                 range(len(traffic_densities))]
+
+            # 过滤掉无效数据点
+            valid_indices = [i for i, value in enumerate(metric_values) if value is not None]
+            valid_x = [traffic_densities[i] for i in valid_indices]
+            valid_y = [metric_values[i] for i in valid_indices]
+
+            if not valid_x:
+                logger.warning(f"跳过无有效数据的指标: {config['metric']}")
+                continue
+
             ax.plot(
-                traffic_densities,
-                metrics[config['metric']],
+                valid_x,
+                valid_y,
                 color=config['color'],
                 marker=config['marker'],
                 linewidth=2,
-                markersize=8,
-                label=config['title']
+                markersize=8
             )
 
             ax.set_title(config['title'], fontsize=12)
-            ax.set_xlabel('Traffic Density (UAVs/min)', fontsize=10)
+            ax.set_xlabel('交通密度(UAVs/分钟)', fontsize=10)
             ax.set_ylabel(config['ylabel'], fontsize=10)
             ax.grid(True, linestyle='--', alpha=0.7)
             ax.tick_params(axis='both', labelsize=9)
 
-            for x, y in zip(traffic_densities, metrics[config['metric']]):
+            # 添加数据标签
+            for x, y in zip(valid_x, valid_y):
                 ax.annotate(
                     f'{y:.3f}',
                     (x, y),
@@ -542,23 +528,21 @@ def plot_performance(metrics: Dict, traffic_densities: List[int]):
                     fontsize=8
                 )
 
-            ax.legend()
-
         plt.tight_layout()
-        save_path = 'performance_evaluation.png'
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_path = f'performance_evaluation_{timestamp}.png'
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.show()
+        logger.info(f"性能评估图表已保存至: {save_path}")
         plt.close()
 
     except Exception as e:
-        print(f"绘图过程中出现错误: {str(e)}")
-        print(f"错误类型: {type(e)}")
-        import traceback
-        print("详细错误信息:")
-        print(traceback.format_exc())
+        logger.error(f"绘图错误: {str(e)}", exc_info=True)
+        plt.close()  # 确保关闭图形
 
 
 def evaluate_performance(results_file: str):
+    """评估性能并生成图表"""
+    logger = logging.getLogger(__name__)
     try:
         with open(results_file, "r") as f:
             results = json.load(f)
@@ -573,7 +557,12 @@ def evaluate_performance(results_file: str):
         traffic_densities = [10, 20, 30, 40, 50, 60]
 
         for density in traffic_densities:
-            density_results = results[str(density)]
+            density_str = str(density)
+            if density_str not in results:
+                logger.warning(f"找不到密度 {density} 的结果")
+                continue
+
+            density_results = results[density_str]
 
             success_rates = []
             computing_times = []
@@ -585,18 +574,23 @@ def evaluate_performance(results_file: str):
                 if num_uavs == 0:
                     continue
 
+                # 计算成功率
                 num_resolved = sum(
                     1 for uav in scene_result['uavs']
-                    if 'optimal_trajectory' in uav and uav['optimal_trajectory'] is not None
+                    if uav.get('optimal_trajectory') is not None
                 )
                 success_rates.append(num_resolved / num_uavs)
 
-                avg_computing_time = np.mean([
+                # 计算平均计算时间
+                valid_times = [
                     uav['computing_time']
                     for uav in scene_result['uavs']
-                ])
-                computing_times.append(avg_computing_time)
+                    if isinstance(uav['computing_time'], (int, float))
+                ]
+                if valid_times:
+                    computing_times.append(np.mean(valid_times))
 
+                # 计算能耗率
                 total_initial_energy = sum(
                     uav['initial_energy']
                     for uav in scene_result['uavs']
@@ -605,28 +599,46 @@ def evaluate_performance(results_file: str):
                     total_extra_energy = sum(
                         uav['extra_energy']
                         for uav in scene_result['uavs']
+                        if uav['extra_energy'] != float('inf')
                     )
                     extra_energy_rates.append(total_extra_energy / total_initial_energy)
 
-                avg_delay_time = np.mean([
+                # 计算延迟率
+                valid_delays = [
                     uav['delay_time']
                     for uav in scene_result['uavs']
-                ])
-                delay_time_rates.append(avg_delay_time / SIMULATION_DURATION)
+                    if uav['delay_time'] != float('inf')
+                ]
+                if valid_delays:
+                    delay_time_rates.append(np.mean(valid_delays) / SIMULATION_DURATION)
 
-            metrics["conflict_resolution_success_rate"].append(np.mean(success_rates))
-            metrics["average_computing_time"].append(np.mean(computing_times))
-            metrics["average_extra_energy_consumption_rate"].append(np.mean(extra_energy_rates))
-            metrics["average_delay_time_rate"].append(np.mean(delay_time_rates))
+            # 计算平均值并添加到指标中
+            if success_rates:
+                metrics["conflict_resolution_success_rate"].append(np.mean(success_rates))
+            else:
+                metrics["conflict_resolution_success_rate"].append(None)
 
+            if computing_times:
+                metrics["average_computing_time"].append(np.mean(computing_times))
+            else:
+                metrics["average_computing_time"].append(None)
+
+            if extra_energy_rates:
+                metrics["average_extra_energy_consumption_rate"].append(np.mean(extra_energy_rates))
+            else:
+                metrics["average_extra_energy_consumption_rate"].append(None)
+
+            if delay_time_rates:
+                metrics["average_delay_time_rate"].append(np.mean(delay_time_rates))
+            else:
+                metrics["average_delay_time_rate"].append(None)
+
+        # 绘制性能图表
         plot_performance(metrics, traffic_densities)
+        logger.info("性能评估完成")
 
     except Exception as e:
-        print(f"性能评估过程中出现错误: {str(e)}")
-        print(f"错误类型: {type(e)}")
-        import traceback
-        print("详细错误信息:")
-        print(traceback.format_exc())
+        logger.error(f"性能评估错误: {str(e)}", exc_info=True)
 
 
 def main():
